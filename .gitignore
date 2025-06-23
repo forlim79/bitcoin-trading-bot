@@ -1,0 +1,11 @@
+# API 키와 로그는 업로드하지 않음
+.env
+*.log
+logs/
+data/
+backups/
+bot.pid
+venv/
+__pycache__/
+*.pyc
+.DS_Store
