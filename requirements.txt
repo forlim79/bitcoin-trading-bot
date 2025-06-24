@@ -1,4 +1,4 @@
-
+  GNU nano 6.2    /home/ubuntu/bitcoin-trading-bot/requirements.txt *
 pandas>=1.5.0
 numpy>=1.24.0
 ccxt>=4.0.0
@@ -11,4 +11,5 @@ tensorflow
 google-api-python-client
 google-auth-httplib2
 google-auth-oauthlib
-
+praw
+textblob
