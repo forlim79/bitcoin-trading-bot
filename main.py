@@ -36,11 +36,21 @@ class EnhancedBitcoinTradingBot:
         self.reddit_client_id = os.environ.get('REDDIT_CLIENT_ID')
         self.reddit_client_secret = os.environ.get('REDDIT_CLIENT_SECRET')
         
-        # 설정
+        # 설정 - 개선된 매매 파라미터
         self.symbol = "KRW-BTC"
-        self.trade_amount = 100000  # 10만원
         self.lookback_days = 60
         self.lstm_sequence_length = 10
+        
+        # 수수료 및 매매 설정
+        self.trading_fee = 0.0005  # 0.05% 수수료
+        self.min_trade_amount = 5000  # 최소 거래 금액 (업비트 기준)
+        self.max_portfolio_ratio = 0.1  # 한 번에 투자할 수 있는 최대 비율 (10%)
+        self.min_portfolio_ratio = 0.02  # 최소 투자 비율 (2%)
+        self.take_profit_ratio = 0.3  # 수익 실현 비율 (30%)
+        self.stop_loss_ratio = 0.5  # 손절 비율 (50%)
+        
+        # 최소 수익률 임계값 (수수료 고려)
+        self.min_profit_threshold = self.trading_fee * 3  # 수수료의 3배 (0.15%)
         
         # 모델 가중치 (앙상블용)
         self.model_weights = {
@@ -118,6 +128,58 @@ class EnhancedBitcoinTradingBot:
         df = df.sort_values('datetime').reset_index(drop=True)
         
         return df
+    
+    def calculate_portfolio_value(self):
+        """현재 포트폴리오 가치 계산"""
+        try:
+            # 잔고 조회
+            balance_url = "https://api.upbit.com/v1/accounts"
+            balance_response = requests.get(balance_url, headers=self.get_upbit_headers())
+            balances = balance_response.json()
+            
+            # 현재 가격 조회
+            ticker_url = "https://api.upbit.com/v1/ticker"
+            ticker_response = requests.get(ticker_url, params={'markets': self.symbol})
+            current_price = ticker_response.json()[0]['trade_price']
+            
+            krw_balance = 0
+            btc_balance = 0
+            
+            for balance in balances:
+                if balance['currency'] == 'KRW':
+                    krw_balance = float(balance['balance'])
+                elif balance['currency'] == 'BTC':
+                    btc_balance = float(balance['balance'])
+            
+            btc_value = btc_balance * current_price
+            total_value = krw_balance + btc_value
+            
+            return {
+                'krw_balance': krw_balance,
+                'btc_balance': btc_balance,
+                'btc_value': btc_value,
+                'total_value': total_value,
+                'current_price': current_price
+            }
+        
+        except Exception as e:
+            print(f"포트폴리오 조회 오류: {e}")
+            return None
+    
+    def calculate_dynamic_trade_amount(self, portfolio_data, signal_strength):
+        """신호 강도와 포트폴리오 비율에 따른 동적 거래 금액 계산"""
+        total_value = portfolio_data['total_value']
+        
+        # 신호 강도에 따른 비율 조정 (1-10 범위를 0.02-0.1로 매핑)
+        ratio = self.min_portfolio_ratio + (signal_strength - 1) * (self.max_portfolio_ratio - self.min_portfolio_ratio) / 9
+        
+        trade_amount = total_value * ratio
+        
+        # 최소 거래 금액 확인
+        if trade_amount < self.min_trade_amount:
+            trade_amount = self.min_trade_amount
+        
+        return trade_amount
     
     def get_market_dominance_data(self):
         """전체 시장 데이터 및 비트코인 도미넌스 수집"""
@@ -346,8 +408,8 @@ class EnhancedBitcoinTradingBot:
             return weighted_sum / total_weight
         return None
     
-    def generate_trading_signal(self, df, predictions, market_data, sentiment_data):
-        """거래 신호 생성"""
+    def generate_trading_signal(self, df, predictions, market_data, sentiment_data, portfolio_data):
+        """개선된 거래 신호 생성"""
         current_price = df['trade_price'].iloc[-1]
         ensemble_prediction = self.make_ensemble_prediction(predictions)
         
@@ -357,6 +419,10 @@ class EnhancedBitcoinTradingBot:
         # 예측 가격 변화율
         price_change_pct = (ensemble_prediction - current_price) / current_price
         
+        # 수수료를 고려한 최소 수익률 확인
+        if abs(price_change_pct) < self.min_profit_threshold:
+            return "HOLD", 0
+        
         # 추가 조건들
         rsi = df['rsi'].iloc[-1]
         macd_histogram = df['macd_histogram'].iloc[-1]
@@ -364,119 +430,129 @@ class EnhancedBitcoinTradingBot:
         fear_greed = market_data['fear_greed_index']
         sentiment_score = sentiment_data['sentiment_score']
         
-        # 매수 조건
+        # 포트폴리오 비율 확인
+        btc_ratio = portfolio_data['btc_value'] / portfolio_data['total_value'] if portfolio_data['total_value'] > 0 else 0
+        
+        # 매수 조건 (수수료 고려하여 더 엄격하게)
         buy_conditions = [
-            price_change_pct > 0.02,  # 2% 이상 상승 예측
-            rsi < 70,  # RSI 과매수 아님
-            bb_position < 0.8,  # 볼린저 밴드 상단 근처 아님
-            fear_greed < 80,  # 극도의 탐욕 아님
-            sentiment_score > -0.1  # 극도로 부정적이지 않음
+            price_change_pct > self.min_profit_threshold * 2,  # 수수료의 2배 이상 상승 예측
+            rsi < 65,  # RSI 과매수 아님 (더 보수적)
+            bb_position < 0.75,  # 볼린저 밴드 상단 근처 아님
+            fear_greed < 75,  # 극도의 탐욕 아님
+            sentiment_score > -0.2,  # 극도로 부정적이지 않음
+            btc_ratio < 0.7,  # BTC 비중이 70% 미만
+            portfolio_data['krw_balance'] >= self.min_trade_amount  # 충분한 KRW 잔고
         ]
         
-        # 매도 조건
+        # 매도 조건 (부분 매도 고려)
         sell_conditions = [
-            price_change_pct < -0.02,  # 2% 이상 하락 예측
-            rsi > 30,  # RSI 과매도 아님
-            bb_position > 0.2,  # 볼린저 밴드 하단 근처 아님
-            fear_greed > 20,  # 극도의 공포 아님  
-            sentiment_score < 0.1  # 극도로 긍정적이지 않음
+            price_change_pct < -self.min_profit_threshold * 2,  # 수수료의 2배 이상 하락 예측
+            rsi > 35,  # RSI 과매도 아님 (더 보수적)
+            bb_position > 0.25,  # 볼린저 밴드 하단 근처 아님
+            fear_greed > 25,  # 극도의 공포 아님  
+            sentiment_score < 0.2,  # 극도로 긍정적이지 않음
+            btc_ratio > 0.1,  # BTC 보유 중
+            portfolio_data['btc_balance'] > 0  # BTC 잔고 보유
         ]
         
         buy_score = sum(buy_conditions)
         sell_score = sum(sell_conditions)
         
-        # 신뢰도 계산
-        confidence = abs(price_change_pct) * 100
+        # 신뢰도 계산 (수수료 고려)
+        confidence = min(abs(price_change_pct) * 50, 10)  # 0-10 범위
         
-        if buy_score >= 4 and confidence > 1:
-            return "BUY", min(confidence, 10)
-        elif sell_score >= 4 and confidence > 1:
-            return "SELL", min(confidence, 10)
+        if buy_score >= 6 and confidence > 2:
+            return "BUY", confidence
+        elif sell_score >= 6 and confidence > 2:
+            return "SELL", confidence
         else:
             return "HOLD", confidence
     
-    def execute_trade(self, signal, confidence):
-        """실제 거래 실행"""
+    def execute_trade(self, signal, confidence, portfolio_data):
+        """개선된 거래 실행"""
         if signal == "HOLD":
             return {"status": "hold", "message": "거래 신호 없음"}
         
         try:
-            # 잔고 조회
-            balance_url = "https://api.upbit.com/v1/accounts"
-            balance_response = requests.get(balance_url, headers=self.get_upbit_headers())
-            balances = balance_response.json()
+            current_price = portfolio_data['current_price']
             
-            krw_balance = 0
-            btc_balance = 0
+            if signal == "BUY":
+                # 동적 거래 금액 계산
+                trade_amount = self.calculate_dynamic_trade_amount(portfolio_data, confidence)
+                
+                # 수수료 고려한 실제 투자 금액
+                trade_amount_after_fee = trade_amount * (1 - self.trading_fee)
+                
+                if portfolio_data['krw_balance'] >= trade_amount:
+                    # 매수 주문
+                    order_data = {
+                        'market': self.symbol,
+                        'side': 'bid',
+                        'price': str(int(trade_amount)),
+                        'ord_type': 'price'
+                    }
+                    
+                    query_string = '&'.join([f"{k}={v}" for k, v in order_data.items()])
+                    order_url = "https://api.upbit.com/v1/orders"
+                    
+                    order_response = requests.post(
+                        order_url,
+                        json=order_data,
+                        headers=self.get_upbit_headers(query_string)
+                    )
+                    
+                    result = order_response.json()
+                    return {
+                        "status": "buy_executed",
+                        "order_id": result.get('uuid'),
+                        "price": current_price,
+                        "amount": trade_amount,
+                        "amount_after_fee": trade_amount_after_fee,
+                        "confidence": confidence,
+                        "portfolio_ratio": trade_amount / portfolio_data['total_value']
+                    }
+                else:
+                    return {"status": "insufficient_krw_balance", "message": f"KRW 잔고 부족: {portfolio_data['krw_balance']:.0f} < {trade_amount:.0f}"}
             
-            for balance in balances:
-                if balance['currency'] == 'KRW':
-                    krw_balance = float(balance['balance'])
-                elif balance['currency'] == 'BTC':
-                    btc_balance = float(balance['balance'])
-            
-            # 현재 가격 조회
-            ticker_url = "https://api.upbit.com/v1/ticker"
-            ticker_response = requests.get(ticker_url, params={'markets': self.symbol})
-            current_price = ticker_response.json()[0]['trade_price']
-            
-            # 거래 실행
-            if signal == "BUY" and krw_balance >= self.trade_amount:
-                # 매수 주문
-                order_data = {
-                    'market': self.symbol,
-                    'side': 'bid',
-                    'price': str(self.trade_amount),
-                    'ord_type': 'price'
-                }
+            elif signal == "SELL":
+                # 부분 매도 (신뢰도에 따라 비율 조정)
+                sell_ratio = min(confidence / 10 * self.take_profit_ratio, self.take_profit_ratio)
+                sell_volume = portfolio_data['btc_balance'] * sell_ratio
                 
-                query_string = '&'.join([f"{k}={v}" for k, v in order_data.items()])
-                order_url = "https://api.upbit.com/v1/orders"
-                
-                order_response = requests.post(
-                    order_url,
-                    json=order_data,
-                    headers=self.get_upbit_headers(query_string)
-                )
-                
-                result = order_response.json()
-                return {
-                    "status": "buy_executed",
-                    "order_id": result.get('uuid'),
-                    "price": current_price,
-                    "amount": self.trade_amount,
-                    "confidence": confidence
-                }
-            
-            elif signal == "SELL" and btc_balance > 0:
-                # 매도 주문
-                order_data = {
-                    'market': self.symbol,
-                    'side': 'ask',
-                    'volume': str(btc_balance),
-                    'ord_type': 'market'
-                }
-                
-                query_string = '&'.join([f"{k}={v}" for k, v in order_data.items()])
-                order_url = "https://api.upbit.com/v1/orders"
-                
-                order_response = requests.post(
-                    order_url,
-                    json=order_data,
-                    headers=self.get_upbit_headers(query_string)
-                )
-                
-                result = order_response.json()
-                return {
-                    "status": "sell_executed",
-                    "order_id": result.get('uuid'),
-                    "price": current_price,
-                    "volume": btc_balance,
-                    "confidence": confidence
-                }
-            
-            else:
-                return {"status": "insufficient_balance", "message": "잔고 부족"}
+                if sell_volume * current_price >= self.min_trade_amount:
+                    # 매도 주문
+                    order_data = {
+                        'market': self.symbol,
+                        'side': 'ask',
+                        'volume': f"{sell_volume:.8f}",
+                        'ord_type': 'market'
+                    }
+                    
+                    query_string = '&'.join([f"{k}={v}" for k, v in order_data.items()])
+                    order_url = "https://api.upbit.com/v1/orders"
+                    
+                    order_response = requests.post(
+                        order_url,
+                        json=order_data,
+                        headers=self.get_upbit_headers(query_string)
+                    )
+                    
+                    result = order_response.json()
+                    expected_amount = sell_volume * current_price
+                    expected_amount_after_fee = expected_amount * (1 - self.trading_fee)
+                    
+                    return {
+                        "status": "sell_executed",
+                        "order_id": result.get('uuid'),
+                        "price": current_price,
+                        "volume": sell_volume,
+                        "sell_ratio": sell_ratio,
+                        "expected_amount": expected_amount,
+                        "expected_amount_after_fee": expected_amount_after_fee,
+                        "confidence": confidence
+                    }
+                else:
+                    return {"status": "insufficient_btc_balance", "message": f"BTC 잔고 부족 또는 최소 거래 금액 미달"}
         
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -484,39 +560,31 @@ class EnhancedBitcoinTradingBot:
     def calculate_portfolio_return(self):
         """포트폴리오 수익률 계산"""
         try:
-            # 잔고 조회
-            balance_url = "https://api.upbit.com/v1/accounts"
-            balance_response = requests.get(balance_url, headers=self.get_upbit_headers())
-            balances = balance_response.json()
-            
-            # 현재 가격 조회
-            ticker_url = "https://api.upbit.com/v1/ticker"
-            ticker_response = requests.get(ticker_url, params={'markets': self.symbol})
-            current_price = ticker_response.json()[0]['trade_price']
-            
-            total_value = 0
-            for balance in balances:
-                if balance['currency'] == 'KRW':
-                    total_value += float(balance['balance'])
-                elif balance['currency'] == 'BTC':
-                    total_value += float(balance['balance']) * current_price
+            portfolio_data = self.calculate_portfolio_value()
+            if not portfolio_data:
+                return {"error": "포트폴리오 데이터 조회 실패"}
             
             # 초기 투자금 (환경 변수에서 설정)
             initial_investment = float(os.environ.get('INITIAL_INVESTMENT', 1000000))
+            total_value = portfolio_data['total_value']
             return_rate = ((total_value - initial_investment) / initial_investment) * 100
             
             return {
                 'total_value': total_value,
                 'initial_investment': initial_investment,
                 'return_rate': return_rate,
-                'profit_loss': total_value - initial_investment
+                'profit_loss': total_value - initial_investment,
+                'krw_balance': portfolio_data['krw_balance'],
+                'btc_balance': portfolio_data['btc_balance'],
+                'btc_value': portfolio_data['btc_value'],
+                'btc_ratio': portfolio_data['btc_value'] / total_value if total_value > 0 else 0
             }
         
         except Exception as e:
             return {"error": str(e)}
     
     def log_to_sheets(self, trade_result, portfolio_return, predictions, market_data, sentiment_data):
-        """구글 시트에 결과 기록"""
+        """구글 시트에 결과 기록 (수수료 정보 포함)"""
         try:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             
@@ -525,77 +593,22 @@ class EnhancedBitcoinTradingBot:
                 trade_result.get('status', 'N/A'),
                 trade_result.get('price', 0),
                 trade_result.get('amount', 0),
+                trade_result.get('amount_after_fee', 0) if 'amount_after_fee' in trade_result else trade_result.get('expected_amount_after_fee', 0),
                 trade_result.get('confidence', 0),
+                trade_result.get('portfolio_ratio', 0) if 'portfolio_ratio' in trade_result else trade_result.get('sell_ratio', 0),
                 portfolio_return.get('total_value', 0),
                 portfolio_return.get('return_rate', 0),
+                portfolio_return.get('btc_ratio', 0),
                 predictions.get('technical', 0),
                 predictions.get('lstm', 0),
                 predictions.get('sentiment', 0),
                 predictions.get('market', 0),
                 market_data.get('btc_dominance', 0),
                 market_data.get('fear_greed_index', 0),
-                sentiment_data.get('sentiment_score', 0)
+                sentiment_data.get('sentiment_score', 0),
+                self.trading_fee  # 수수료 기록
             ]]
             
             body = {'values': values}
             
             self.sheets_service.spreadsheets().values().append(
-                spreadsheetId=self.spreadsheet_id,
-                range='A:N',
-                valueInputOption='RAW',
-                body=body
-            ).execute()
-            
-            return True
-        
-        except Exception as e:
-            print(f"시트 기록 오류: {e}")
-            return False
-
-def lambda_handler(event, context):
-    """Lambda 메인 핸들러"""
-    try:
-        bot = EnhancedBitcoinTradingBot()
-        
-        # 1. 데이터 수집
-        print("데이터 수집 중...")
-        df = bot.get_market_data()
-        df = bot.create_advanced_technical_indicators(df)
-        
-        market_data = bot.get_market_dominance_data()
-        sentiment_data = bot.get_social_sentiment()
-        
-        # 2. 모델 훈련 및 예측
-        print("모델 훈련 및 예측 중...")
-        predictions = bot.train_models(df, market_data, sentiment_data)
-        
-        # 3. 거래 신호 생성
-        signal, confidence = bot.generate_trading_signal(df, predictions, market_data, sentiment_data)
-        
-        # 4. 거래 실행
-        print(f"거래 신호: {signal}, 신뢰도: {confidence}")
-        trade_result = bot.execute_trade(signal, confidence)
-        
-        # 5. 수익률 계산
-        portfolio_return = bot.calculate_portfolio_return()
-        
-        # 6. 결과 기록
-        bot.log_to_sheets(trade_result, portfolio_return, predictions, market_data, sentiment_data)
-        
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'signal': signal,
-                'confidence': confidence,
-                'trade_result': trade_result,
-                'portfolio_return': portfolio_return,
-                'predictions': predictions
-            }, ensure_ascii=False)
-        }
-    
-    except Exception as e:
-        print(f"오류 발생: {str(e)}")
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)}, ensure_ascii=False)
-        }
