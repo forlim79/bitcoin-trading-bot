@@ -1,3 +1,4 @@
+
 pandas>=1.5.0
 numpy>=1.24.0
 ccxt>=4.0.0
@@ -7,3 +8,7 @@ xgboost>=1.7.0
 joblib>=1.3.0
 python-dotenv>=1.0.0
 tensorflow
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
