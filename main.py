@@ -73,18 +73,28 @@ class EnhancedBitcoinTradingBot:
         self.upbit_secret_key = secrets_dict.get('UPBIT_SECRET_KEY')
         
         # --- 수정된 부분 시작 ---
-        # GOOGLE_SERVICE_ACCOUNT_JSON을 문자열로 가져온 후 JSON으로 파싱
-        google_service_account_json_str = secrets_dict.get('GOOGLE_SERVICE_ACCOUNT_JSON')
+        # GOOGLE_SERVICE_ACCOUNT_JSON 처리 (문자열 또는 딕셔너리 형태 모두 지원)
+        google_service_account_data = secrets_dict.get('GOOGLE_SERVICE_ACCOUNT_JSON')
         
-        if google_service_account_json_str:
+        if google_service_account_data:
             try:
-                # 문자열을 JSON 객체로 파싱
-                self.google_credentials_json = json.loads(google_service_account_json_str)
-                logging.info("Google 서비스 계정 JSON이 성공적으로 파싱되었습니다.")
+                # 이미 딕셔너리인 경우와 문자열인 경우를 모두 처리
+                if isinstance(google_service_account_data, dict):
+                    self.google_credentials_json = google_service_account_data
+                    logging.info("Google 서비스 계정 JSON이 딕셔너리 형태로 로드되었습니다.")
+                elif isinstance(google_service_account_data, str):
+                    self.google_credentials_json = json.loads(google_service_account_data)
+                    logging.info("Google 서비스 계정 JSON이 문자열에서 파싱되었습니다.")
+                else:
+                    raise ValueError(f"GOOGLE_SERVICE_ACCOUNT_JSON의 타입이 예상과 다릅니다: {type(google_service_account_data)}")
+                    
             except json.JSONDecodeError as e:
                 logging.error(f"Google 서비스 계정 JSON 파싱 오류: {e}")
-                logging.error(f"JSON 문자열: {google_service_account_json_str[:100]}...")  # 처음 100자만 로그
+                logging.error(f"JSON 데이터: {str(google_service_account_data)[:100]}...")  # 처음 100자만 로그
                 raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 형식이 올바르지 않습니다.")
+            except Exception as e:
+                logging.error(f"Google 서비스 계정 JSON 처리 중 예상치 못한 오류: {e}")
+                raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 처리에 실패했습니다.")
         else:
             logging.error("GOOGLE_SERVICE_ACCOUNT_JSON이 Secrets Manager에서 찾을 수 없습니다.")
             raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON이 설정되지 않았습니다.")
