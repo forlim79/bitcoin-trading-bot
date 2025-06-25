@@ -71,36 +71,41 @@ class EnhancedBitcoinTradingBot:
         # 로드된 값으로 봇 설정
         self.upbit_access_key = secrets_dict.get('UPBIT_ACCESS_KEY')
         self.upbit_secret_key = secrets_dict.get('UPBIT_SECRET_KEY')
-        self.google_credentials_json_str = secrets_dict.get('GOOGLE_SERVICE_ACCOUNT_JSON') # JSON 문자열 형태
+        
+        # --- 수정된 부분 시작 ---
+        # GOOGLE_SERVICE_ACCOUNT_JSON을 Secrets Manager에서 바로 딕셔너리로 가져옵니다.
+        # Secrets Manager에는 이 필드가 JSON 객체 형태로 저장되어 있다고 가정합니다.
+        self.google_credentials_json = secrets_dict.get('GOOGLE_SERVICE_ACCOUNT_JSON') 
+        # --- 수정된 부분 끝 ---
+        
         self.spreadsheet_id = secrets_dict.get('GOOGLE_SPREADSHEET_ID')
         self.initial_investment = float(secrets_dict.get('INITIAL_INVESTMENT', 1000000))
         
         # 트위터는 사용하지 않으므로 관련 키는 로드하지 않음
-        self.twitter_bearer_token = None 
+        self.twitter_bearer_token = None
         
         self.reddit_client_id = secrets_dict.get('REDDIT_CLIENT_ID')
         self.reddit_client_secret = secrets_dict.get('REDDIT_CLIENT_SECRET')
         
         # 필수 API 키가 설정되었는지 확인
-        if not all([self.upbit_access_key, self.upbit_secret_key, 
-                      self.google_credentials_json_str, self.spreadsheet_id]):
+        if not all([self.upbit_access_key, self.upbit_secret_key, self.spreadsheet_id]):
             logging.error("Secrets Manager에서 필수 API 키를 로드하는 데 실패했습니다. 누락된 키가 있습니다.")
             raise ValueError("필수 환경 변수가 Secrets Manager에 올바르게 설정되지 않았습니다.")
 
-        # Google 서비스 계정 JSON 문자열을 실제 JSON 객체로 파싱
-        try:
-            self.google_credentials_json = json.loads(self.google_credentials_json_str)
-            logging.info("Google 서비스 계정 JSON이 성공적으로 파싱되었습니다.")
-        except json.JSONDecodeError as e:
-            logging.critical(f"Google 서비스 계정 JSON 파싱 오류: {e}. Secrets Manager에 저장된 JSON 문자열 형식을 확인하세요.")
+        # --- 추가된 유효성 검사 (Google 서비스 계정 JSON이 올바른 딕셔너리인지 확인) ---
+        if not isinstance(self.google_credentials_json, dict) or not self.google_credentials_json:
+            logging.critical("Secrets Manager의 'GOOGLE_SERVICE_ACCOUNT_JSON'이 올바른 JSON 객체 형식이 아니거나 비어 있습니다.")
             raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON 형식이 올바르지 않습니다. Secrets Manager의 값을 확인하세요.")
+            
+        logging.info("Google 서비스 계정 JSON이 Secrets Manager에서 성공적으로 로드되었습니다.")
+        # --- 추가된 유효성 검사 끝 ---
 
         # 나머지 설정은 기존과 동일
         self.symbol = "KRW-BTC"
         self.lookback_days = 60
         self.lstm_sequence_length = 10
         self.fee_rate = 0.005
-        self.min_profit_threshold = 0.012 
+        self.min_profit_threshold = 0.012
         self.max_position_ratio = 0.8
         self.base_trade_ratio = 0.1
         self.volatility_adjustment = True
@@ -136,23 +141,39 @@ class EnhancedBitcoinTradingBot:
         """소셜 미디어 클라이언트 설정 (트위터 제외)"""
         try:
             # 트위터 클라이언트 설정 로직 제거 (twitter_bearer_token이 None이므로 자동 스킵)
-            # if self.twitter_bearer_token:
-            #     self.twitter_client = tweepy.Client(bearer_token=self.twitter_bearer_token)
-            #     logging.info("트위터 클라이언트가 성공적으로 설정되었습니다.")
-            # else:
-            #     logging.warning("트위터 Bearer 토큰이 없어 트위터 클라이언트를 설정하지 않습니다.")
             
-            if self.reddit_client_id and self.reddit_client_secret:
-                self.reddit = praw.Reddit(
-                    client_id=self.reddit_client_id,
-                    client_secret=self.reddit_client_secret,
-                    user_agent="bitcoin_bot/1.0" # User-Agent는 필수입니다. 실제 사용자에 맞게 수정하세요.
-                )
-                logging.info("레딧 클라이언트가 성공적으로 설정되었습니다.")
+            if hasattr(self, 'reddit') and self.reddit: # reddit 객체가 성공적으로 초기화되었는지 확인
+                logging.info("레딧 감정 분석 시작...")
+                subreddit = self.reddit.subreddit('Bitcoin')
+                hot_posts = subreddit.hot(limit=50)
+                
+                post_count = 0
+                for post in hot_posts:
+                    text_content = post.title
+                    if post.selftext:
+                        text_content += " " + post.selftext
+                    
+                    if text_content.strip():
+                        blob = TextBlob(text_content)
+                        sentiment_scores.append(blob.sentiment.polarity)
+                        post_count += 1
+                logging.info(f"레딧에서 {post_count}개의 게시글을 분석했습니다.")
             else:
-                logging.warning("레딧 클라이언트 ID 또는 시크릿이 없어 레딧 클라이언트를 설정하지 않습니다.")
+                logging.warning("레딧 클라이언트가 설정되지 않아 레딧 감정 분석을 건너뜁니다.")
+            
         except Exception as e:
-            logging.error(f"소셜 미디어 클라이언트 설정 오류: {e}")
+            logging.error(f"소셜 미디어 분석 중 오류 발생: {e}")
+        
+        if sentiment_scores:
+            avg_sentiment = np.mean(sentiment_scores)
+            sentiment_volatility = np.std(sentiment_scores)
+            return {
+                'sentiment_score': avg_sentiment,
+                'sentiment_volatility': sentiment_volatility,
+                'sample_size': len(sentiment_scores)
+            }
+        else:
+            return {'sentiment_score': 0, 'sentiment_volatility': 0, 'sample_size': 0}
 
     def get_upbit_headers(self, params=None, json_data=None):
         """
@@ -557,7 +578,7 @@ class EnhancedBitcoinTradingBot:
             return "HOLD", 0, 0
         
         price_change_pct = (ensemble_prediction - current_price) / current_price
-        required_return_pct = self.min_profit_threshold 
+        required_return_pct = self.min_profit_threshold
         
         logging.info(f"예측 가격 변화율: {price_change_pct:.2%}, 요구 수익률: {required_return_pct:.2%}")
 
@@ -688,14 +709,14 @@ class EnhancedBitcoinTradingBot:
                 if btc_balance > 0:
                     sell_ratio = self.partial_sell_ratio
                     if confidence > 7:
-                        sell_ratio = min(0.6, sell_ratio * 1.5) 
+                        sell_ratio = min(0.6, sell_ratio * 1.5)
                     
                     sell_volume = btc_balance * sell_ratio
                     
                     min_sell_volume_krw_equivalent = 5000 / current_price
                     if sell_volume * current_price < 5000 or sell_volume < 0.00000001:
-                         logging.info(f"매도 보류: 최소 주문 금액 (5,000 KRW) 미만. 계산된 매도 금액: {sell_volume * current_price:,.0f} KRW")
-                         return {"status": "skipped_min_amount", "message": "최소 주문 금액 미만"}
+                            logging.info(f"매도 보류: 최소 주문 금액 (5,000 KRW) 미만. 계산된 매도 금액: {sell_volume * current_price:,.0f} KRW")
+                            return {"status": "skipped_min_amount", "message": "최소 주문 금액 미만"}
                     
                     order_data = {
                         'market': self.symbol,
@@ -721,170 +742,116 @@ class EnhancedBitcoinTradingBot:
                         "sell_ratio_applied": sell_ratio,
                         "remaining_btc": btc_balance - sell_volume,
                         "volatility": volatility,
-                        "message": f"매도 주문 성공: {sell_volume:.8f} BTC"
+                        "message": f"매도 주문 성공: {actual_sell_amount:,.0f} KRW"
                     }
                 else:
                     return {
                         "status": "insufficient_btc_balance",
-                        "message": "매도 보류: BTC 잔고 부족."
+                        "message": "매도 보류: BTC 잔고 부족"
                     }
-            else:
-                return {"status": "error", "message": "알 수 없는 거래 신호"}
-                
         except Exception as e:
-            logging.error(f"거래 실행 중 예상치 못한 오류 발생: {e}")
-            return {"status": "error", "message": str(e)}
+            logging.error(f"거래 실행 중 오류 발생: {e}")
+            return {"status": "error", "message": f"거래 실행 오류: {e}"}
 
-    def calculate_portfolio_return(self):
-        """
-        현재 포트폴리오 가치와 초기 투자금을 기반으로 수익률을 계산합니다.
-        수수료는 이미 거래 시점에 반영되므로 별도로 계산하지 않습니다.
-        """
-        try:
-            balances = self._make_api_request('GET', "https://api.upbit.com/v1/accounts")
-            ticker_data = self._make_api_request('GET', "https://api.upbit.com/v1/ticker", params={'markets': self.symbol})
-            current_price = ticker_data[0]['trade_price'] if ticker_data else 0
-            
-            total_value = 0.0
-            krw_value = 0.0
-            btc_value = 0.0
-
-            for balance in balances:
-                if balance['currency'] == 'KRW':
-                    krw_value = float(balance['balance'])
-                    total_value += krw_value
-                elif balance['currency'] == 'BTC':
-                    btc_value = float(balance['balance']) * current_price
-                    total_value += btc_value
-            
-            # initial_investment는 Secrets Manager에서 로드된 값 사용
-            initial_investment = self.initial_investment
-            
-            profit_loss = total_value - initial_investment
-            return_rate = (profit_loss / initial_investment) * 100 if initial_investment > 0 else 0
-            
-            position_ratio = btc_value / total_value if total_value > 0 else 0
-            
-            return {
-                'total_value': total_value,
-                'initial_investment': initial_investment,
-                'return_rate': return_rate,
-                'profit_loss': profit_loss,
-                'position_ratio': position_ratio,
-                'krw_value': krw_value,
-                'btc_value': btc_value,
-                'current_btc_price': current_price
-            }
-        except Exception as e:
-            logging.error(f"포트폴리오 수익률 계산 오류: {e}")
-            return {"error": str(e)}
-
-    def log_to_sheets(self, trade_result, portfolio_return, predictions, market_data, sentiment_data):
-        """
-        구글 시트에 거래 결과, 포트폴리오 현황, 예측 정보, 시장 및 감정 데이터를 기록합니다.
-        """
+    def update_google_sheets_log(self, log_data):
+        """Google Sheet에 거래 로그 및 포트폴리오 현황을 기록합니다."""
         if not self.sheets_service:
-            logging.warning("Google Sheets 서비스가 설정되지 않아 기록할 수 없습니다.")
+            logging.warning("Google Sheets 서비스가 설정되지 않아 로그를 기록할 수 없습니다.")
             return
 
         try:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            values = [[
-                timestamp,
-                trade_result.get('status', 'N/A'),
-                trade_result.get('price', 0),
-                trade_result.get('amount', 0),
-                trade_result.get('fee', 0),
-                trade_result.get('confidence', 0),
-                trade_result.get('volatility', 0),
-                portfolio_return.get('total_value', 0),
-                portfolio_return.get('initial_investment', 0),
-                portfolio_return.get('profit_loss', 0),
-                portfolio_return.get('return_rate', 0),
-                portfolio_return.get('position_ratio', 0),
-                predictions.get('technical', 0),
-                predictions.get('lstm', 0),
-                predictions.get('sentiment', 0),
-                predictions.get('market', 0),
-                market_data.get('btc_dominance', 0),
-                market_data.get('total_market_cap', 0),
-                market_data.get('fear_greed_index', 0),
-                sentiment_data.get('sentiment_score', 0),
-                sentiment_data.get('sentiment_volatility', 0),
-                sentiment_data.get('sample_size', 0)
-            ]]
-            
+            # 로그 데이터를 Google Sheets에 추가
+            range_name = 'TradeLog!A:Z' # 'TradeLog' 시트의 모든 열
+            values = [
+                [
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    log_data.get("signal", "N/A"),
+                    log_data.get("status", "N/A"),
+                    log_data.get("order_id", ""),
+                    log_data.get("price", 0),
+                    log_data.get("amount", 0), # 매수 시 KRW 금액, 매도 시 BTC 금액
+                    log_data.get("volume", 0), # 매수 시 BTC 수량, 매도 시 BTC 수량
+                    log_data.get("fee", 0),
+                    log_data.get("confidence", 0),
+                    log_data.get("volatility", 0),
+                    log_data.get("portfolio_ratio_after_trade", "N/A"), # 매수 시에만 관련
+                    log_data.get("sell_ratio_applied", "N/A"), # 매도 시에만 관련
+                    log_data.get("remaining_btc", "N/A"), # 매도 시에만 관련
+                    log_data.get("message", "")
+                ]
+            ]
             body = {'values': values}
-            
-            result = self.sheets_service.spreadsheets().values().append(
+            self.sheets_service.spreadsheets().values().append(
                 spreadsheetId=self.spreadsheet_id,
-                range='Sheet1!A:V',
-                valueInputOption='RAW',
+                range=range_name,
+                valueInputOption='USER_ENTERED',
                 body=body
             ).execute()
-            logging.info(f"Google Sheets에 데이터 기록 성공. 업데이트된 셀: {result.get('updates').get('updatedCells')}")
+            logging.info("Google Sheets에 거래 로그를 성공적으로 기록했습니다.")
+
         except Exception as e:
-            logging.error(f"Google Sheets에 데이터 기록 오류: {e}")
+            logging.error(f"Google Sheets에 로그 기록 오류: {e}")
 
     def run(self):
-        """
-        자동매매 봇의 메인 실행 루프.
-        일정 간격으로 데이터를 수집, 분석, 거래 신호 생성, 거래 실행 및 결과 기록을 수행합니다.
-        """
+        """봇의 메인 실행 로직"""
         logging.info("Bitcoin 자동매매 봇을 시작합니다.")
         while True:
             try:
                 logging.info("\n--- 새로운 주기 시작 ---")
                 
-                df_daily = self.get_market_data(interval='days')
-                df_15min = self.get_market_data(interval='minutes_15')
+                # 시장 데이터 수집
+                df_days = self.get_market_data(interval='days')
+                df_minutes_15 = self.get_market_data(interval='minutes_15')
 
-                if df_daily.empty or df_15min.empty:
+                if df_days.empty or df_minutes_15.empty:
                     logging.error("시장 데이터 수집에 실패했습니다. 다음 주기까지 대기합니다.")
+                    time.sleep(300) # 5분 대기
+                    continue
+
+                # 기술적 지표 생성
+                df_days = self.create_advanced_technical_indicators(df_days)
+                df_minutes_15 = self.create_advanced_technical_indicators(df_minutes_15)
+
+                # 시장 지표 수집
+                market_data = self.get_market_dominance_data()
+                
+                # 소셜 미디어 감정 분석
+                sentiment_data = self.get_social_sentiment()
+
+                # 모델 훈련 및 예측
+                predictions = self.train_models(df_days, market_data, sentiment_data)
+                
+                if not predictions:
+                    logging.warning("모델 예측을 생성할 수 없습니다. 다음 주기까지 대기합니다.")
                     time.sleep(300)
                     continue
 
-                df_daily = self.create_advanced_technical_indicators(df_daily)
-                df_15min = self.create_advanced_technical_indicators(df_15min)
-
-                market_data = self.get_market_dominance_data()
-                sentiment_data = self.get_social_sentiment()
-
-                predictions = self.train_models(df_15min, market_data, sentiment_data)
-                
+                # 거래 신호 생성
                 signal, confidence, volatility = self.generate_trading_signal(
-                    df_15min, predictions, market_data, sentiment_data
+                    df_minutes_15, predictions, market_data, sentiment_data
                 )
-                logging.info(f"생성된 거래 신호: {signal} (신뢰도: {confidence:.1f}, 변동성: {volatility:.4f})")
-                
+
+                # 거래 실행
                 trade_result = self.execute_trade(signal, confidence, volatility)
-                logging.info(f"거래 실행 결과: {trade_result.get('message', trade_result.get('status'))}")
+                logging.info(f"거래 결과: {trade_result['message']}")
 
-                portfolio_return = self.calculate_portfolio_return()
-                if not portfolio_return.get('error'):
-                    logging.info(f"현재 포트폴리오 총 가치: {portfolio_return['total_value']:,.0f} KRW")
-                    logging.info(f"수익률: {portfolio_return['return_rate']:.2f}%")
-                    logging.info(f"BTC 포지션 비율: {portfolio_return['position_ratio']:.2%}")
-                else:
-                    logging.error(f"포트폴리오 수익률 계산 오류: {portfolio_return['error']}")
-
-                self.log_to_sheets(trade_result, portfolio_return, predictions, market_data, sentiment_data)
+                # Google Sheets에 로그 기록
+                self.update_google_sheets_log({
+                    **trade_result,
+                    "signal": signal,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
                 
-                logging.info("--- 주기 완료 ---")
-                time.sleep(300)
+                time.sleep(300) # 5분 대기
 
             except Exception as e:
                 logging.critical(f"봇 실행 중 치명적인 오류 발생: {e}", exc_info=True)
-                logging.info("5분 후 재시도합니다...")
-                time.sleep(300)
+                time.sleep(600) # 오류 발생 시 10분 대기 후 재시도
 
+# 봇 실행 (이 부분은 main.py 파일의 가장 하단에 위치해야 합니다.)
 if __name__ == "__main__":
     try:
         bot = EnhancedBitcoinTradingBot()
         bot.run()
-    except ValueError as ve:
-        logging.error(f"설정 오류: {ve}")
     except Exception as e:
-        logging.critical(f"봇 초기화 중 오류 발생: {e}", exc_info=True)
-
+        logging.critical(f"봇 초기화 또는 메인 루프 시작 중 치명적인 오류 발생: {e}", exc_info=True)
